@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Project Preference Collector</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #4CAF50, #45a049);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .phase {
+            display: none;
+        }
+        
+        .phase.active {
+            display: block;
+        }
+        
+        /* Admin Setup */
+        .admin-section {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }
+        
+        .admin-section h3 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.4em;
+        }
+        
+        .project-input-section {
+            margin-bottom: 25px;
+        }
+        
+        .project-input-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+        
+        .project-input {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+        
+        .project-input:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        
+        .remove-project {
+            background: #ff4444;
+            color: white;
+            border: none;
+            padding: 12px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .btn {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            transition: background 0.3s;
+        }
+        
+        .btn:hover {
+            background: #45a049;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+        }
+        
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+        }
+        
+        .btn-danger:hover {
+            background: #c82333;
+        }
+        
+        /* Student Interface */
+        .student-name-section {
+            margin-bottom: 30px;
+        }
+        
+        .student-name-input {
+            width: 100%;
+            padding: 15px;
+            font-size: 18px;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .student-name-input:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        
+        .tokens-section {
+            background: #f1f3f4;
+            padding: 25px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }
+        
+        .tokens-title {
+            font-size: 1.3em;
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .tokens-container {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .token {
+            background: linear-gradient(135deg, #FF6B6B, #ee5a52);
+            color: white;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            font-weight: bold;
+            cursor: grab;
+            user-select: none;
+            box-shadow: 0 4px 15px rgba(255,107,107,0.3);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .token:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255,107,107,0.4);
+        }
+        
+        .token.used {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .token:active {
+            cursor: grabbing;
+        }
+        
+        .projects-section {
+            margin-bottom: 30px;
+        }
+        
+        .project-item {
+            background: white;
+            border: 3px dashed #ddd;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 15px;
+            min-height: 100px;
+            position: relative;
+            transition: border-color 0.3s, background-color 0.3s;
+        }
+        
+        .project-item.drag-over {
+            border-color: #4CAF50;
+            background-color: #f0f8f0;
+        }
+        
+        .project-name {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 15px;
+        }
+        
+        .project-tokens {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .project-token {
+            background: linear-gradient(135deg, #4CAF50, #45a049);
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(76,175,80,0.3);
+        }
+        
+        .project-total {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            background: #333;
+            color: white;
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        
+        /* Results */
+        .results-section {
+            background: #f8f9fa;
+            padding: 30px;
+            border-radius: 10px;
+        }
+        
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            margin-bottom: 10px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        .result-name {
+            font-size: 1.1em;
+            font-weight: 600;
+        }
+        
+        .result-points {
+            background: #4CAF50;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+        }
+        
+        .status-info {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #2196F3;
+        }
+        
+        .error-message {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #f44336;
+        }
+        
+        .success-message {
+            background: #e8f5e8;
+            color: #2e7d2e;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            font-size: 1.1em;
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <div class="header">
+            <h1>Project Preference Collector</h1>
+            <p>Allocate your tokens to show project preferences</p>
+        </div>
+        
+        <div class="content">
+            <!-- Admin Setup Phase -->
+            <div id="adminPhase" class="phase active">
+                <div class="admin-section">
+                    <h3>Admin Setup</h3>
+                    
+                    <div class="project-input-section">
+                        <h4 style="margin-bottom: 15px;">Enter Project Names (3-12 projects):</h4>
+                        <div id="projectInputs">
+                            <div class="project-input-row">
+                                <input type="text" class="project-input" placeholder="Project name...">
+                                <button class="remove-project" onclick="removeProjectInput(this)" style="display: none;">Remove</button>
+                            </div>
+                            <div class="project-input-row">
+                                <input type="text" class="project-input" placeholder="Project name...">
+                                <button class="remove-project" onclick="removeProjectInput(this)">Remove</button>
+                            </div>
+                            <div class="project-input-row">
+                                <input type="text" class="project-input" placeholder="Project name...">
+                                <button class="remove-project" onclick="removeProjectInput(this)">Remove</button>
+                            </div>
+                        </div>
+                        <button class="btn" onclick="addProjectInput()">Add Another Project</button>
+                    </div>
+                    
+                    <button class="btn" onclick="startCollection()">Start Student Collection</button>
+                </div>
+            </div>
+            
+            <!-- Student Collection Phase -->
+            <div id="studentPhase" class="phase">
+                <div class="admin-section">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <div class="status-info" style="margin-bottom: 0; flex: 1;">
+                            <strong>Students submitted: <span id="submissionCount">0</span></strong>
+                        </div>
+                        <div style="font-size: 12px; color: #666;">
+                            <button class="btn btn-secondary" onclick="showResults()" style="font-size: 12px; padding: 6px 12px; margin-right: 5px;">Administrator</button>
+                            <button class="btn btn-danger" onclick="resetCollection()" style="font-size: 12px; padding: 6px 12px;">Admin: Reset</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="student-name-section">
+                    <h3>Enter Your Name:</h3>
+                    <input type="text" id="studentName" class="student-name-input" placeholder="Your name...">
+                    <button class="btn" onclick="startAllocation()">Start Token Allocation</button>
+                </div>
+                
+                <div id="allocationSection" style="display: none;">
+                    <div class="tokens-section">
+                        <div class="tokens-title">Available Tokens (Total: 10 points):</div>
+                        <div class="tokens-container" id="tokensContainer">
+                            <div class="token" draggable="true" data-value="5">5</div>
+                            <div class="token" draggable="true" data-value="2">2</div>
+                            <div class="token" draggable="true" data-value="2">2</div>
+                            <div class="token" draggable="true" data-value="1">1</div>
+                        </div>
+                    </div>
+                    
+                    <div class="projects-section">
+                        <h3>Drag tokens to projects (or click tokens in projects to remove):</h3>
+                        <div id="projectsList"></div>
+                    </div>
+                </div>
+                
+                <div id="submissionSuccess" style="display: none;">
+                    <div class="success-message">
+                        <h3>Thank you!</h3>
+                        <p>Your preferences have been recorded successfully.</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Results Phase -->
+            <div id="resultsPhase" class="phase">
+                <div class="admin-section">
+                    <h3>Admin Controls</h3>
+                    <button class="btn btn-secondary" onclick="backToCollection()">Back to Collection</button>
+                    <button class="btn btn-danger" onclick="resetCollection()">Reset All Data</button>
+                </div>
+                
+                <div class="results-section">
+                    <h3>Final Results</h3>
+                    <div id="resultsList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global state
+        let projects = [];
+        let studentSubmissions = [];
+        let submittedStudents = new Set();
+        let currentStudent = null;
+        let studentAllocations = {};
+
+        // Admin functions
+        function addProjectInput() {
+            const projectInputs = document.getElementById('projectInputs');
+            const inputCount = projectInputs.children.length;
+            
+            if (inputCount >= 12) {
+                alert('Maximum 12 projects allowed');
+                return;
+            }
+            
+            const newRow = document.createElement('div');
+            newRow.className = 'project-input-row';
+            newRow.innerHTML = `
+                <input type="text" class="project-input" placeholder="Project name...">
+                <button class="remove-project" onclick="removeProjectInput(this)">Remove</button>
+            `;
+            projectInputs.appendChild(newRow);
+        }
+
+        function removeProjectInput(button) {
+            const projectInputs = document.getElementById('projectInputs');
+            if (projectInputs.children.length <= 3) {
+                alert('Minimum 3 projects required');
+                return;
+            }
+            button.parentElement.remove();
+        }
+
+        function startCollection() {
+            const inputs = document.querySelectorAll('.project-input');
+            const projectNames = Array.from(inputs)
+                .map(input => input.value.trim())
+                .filter(name => name !== '');
+            
+            if (projectNames.length < 3) {
+                alert('Please enter at least 3 project names');
+                return;
+            }
+            
+            if (projectNames.length > 12) {
+                alert('Maximum 12 projects allowed');
+                return;
+            }
+            
+            // Check for duplicates
+            const uniqueNames = new Set(projectNames);
+            if (uniqueNames.size !== projectNames.length) {
+                alert('Please ensure all project names are unique');
+                return;
+            }
+            
+            projects = projectNames;
+            showPhase('studentPhase');
+            setupProjectsList();
+        }
+
+        function setupProjectsList() {
+            const projectsList = document.getElementById('projectsList');
+            projectsList.innerHTML = '';
+            
+            projects.forEach((project, index) => {
+                const projectDiv = document.createElement('div');
+                projectDiv.className = 'project-item';
+                projectDiv.dataset.projectIndex = index;
+                projectDiv.innerHTML = `
+                    <div class="project-name">${project}</div>
+                    <div class="project-total">Total: 0</div>
+                    <div class="project-tokens"></div>
+                `;
+                
+                // Add drag and drop listeners
+                projectDiv.addEventListener('dragover', handleDragOver);
+                projectDiv.addEventListener('drop', handleDrop);
+                projectDiv.addEventListener('dragleave', handleDragLeave);
+                
+                projectsList.appendChild(projectDiv);
+            });
+        }
+
+        // Student functions
+        function startAllocation() {
+            const studentName = document.getElementById('studentName').value.trim();
+            
+            if (!studentName) {
+                alert('Please enter your name');
+                return;
+            }
+            
+            if (submittedStudents.has(studentName.toLowerCase())) {
+                alert('A student with this name has already submitted preferences');
+                return;
+            }
+            
+            currentStudent = studentName;
+            document.getElementById('allocationSection').style.display = 'block';
+            document.querySelector('.student-name-section').style.display = 'none';
+            
+            // Reset allocations
+            studentAllocations = {};
+            projects.forEach((_, index) => {
+                studentAllocations[index] = [];
+            });
+            
+            setupDragAndDrop();
+        }
+
+        function setupDragAndDrop() {
+            const tokens = document.querySelectorAll('.token');
+            tokens.forEach(token => {
+                token.addEventListener('dragstart', handleDragStart);
+                token.classList.remove('used');
+            });
+        }
+
+        function handleDragStart(e) {
+            if (e.target.classList.contains('used')) {
+                e.preventDefault();
+                return;
+            }
+            e.dataTransfer.setData('text/plain', e.target.dataset.value);
+            e.dataTransfer.effectAllowed = 'move';
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            e.currentTarget.classList.add('drag-over');
+        }
+
+        function handleDragLeave(e) {
+            e.currentTarget.classList.remove('drag-over');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            e.currentTarget.classList.remove('drag-over');
+            
+            const tokenValue = parseInt(e.dataTransfer.getData('text/plain'));
+            const projectIndex = parseInt(e.currentTarget.dataset.projectIndex);
+            
+            // Find and mark the token as used
+            const availableToken = document.querySelector(`.token:not(.used)[data-value="${tokenValue}"]`);
+            if (availableToken) {
+                availableToken.classList.add('used');
+                
+                // Add token to project
+                addTokenToProject(projectIndex, tokenValue);
+                
+                // Check if all tokens are used
+                checkAllTokensUsed();
+            }
+        }
+
+        function addTokenToProject(projectIndex, tokenValue) {
+            studentAllocations[projectIndex].push(tokenValue);
+            
+            const projectDiv = document.querySelector(`[data-project-index="${projectIndex}"]`);
+            const tokensContainer = projectDiv.querySelector('.project-tokens');
+            const totalElement = projectDiv.querySelector('.project-total');
+            
+            // Add token visual
+            const tokenElement = document.createElement('div');
+            tokenElement.className = 'project-token';
+            tokenElement.textContent = tokenValue;
+            tokenElement.onclick = () => removeTokenFromProject(projectIndex, tokenValue, tokenElement);
+            tokensContainer.appendChild(tokenElement);
+            
+            // Update total
+            const total = studentAllocations[projectIndex].reduce((sum, val) => sum + val, 0);
+            totalElement.textContent = `Total: ${total}`;
+        }
+
+        function removeTokenFromProject(projectIndex, tokenValue, tokenElement) {
+            // Remove from allocations
+            const index = studentAllocations[projectIndex].indexOf(tokenValue);
+            if (index > -1) {
+                studentAllocations[projectIndex].splice(index, 1);
+            }
+            
+            // Remove visual token
+            tokenElement.remove();
+            
+            // Update total
+            const projectDiv = document.querySelector(`[data-project-index="${projectIndex}"]`);
+            const totalElement = projectDiv.querySelector('.project-total');
+            const total = studentAllocations[projectIndex].reduce((sum, val) => sum + val, 0);
+            totalElement.textContent = `Total: ${total}`;
+            
+            // Make original token available again
+            const originalToken = document.querySelector(`.token.used[data-value="${tokenValue}"]`);
+            if (originalToken) {
+                originalToken.classList.remove('used');
+            }
+        }
+
+        function checkAllTokensUsed() {
+            const usedTokens = document.querySelectorAll('.token.used').length;
+            if (usedTokens === 4) {
+                // All tokens used, auto-submit
+                submitStudentPreferences();
+            }
+        }
+
+        function submitStudentPreferences() {
+            const submission = {
+                student: currentStudent,
+                allocations: { ...studentAllocations }
+            };
+            
+            studentSubmissions.push(submission);
+            submittedStudents.add(currentStudent.toLowerCase());
+            
+            // Update submission count
+            document.getElementById('submissionCount').textContent = studentSubmissions.length;
+            
+            // Show success and reset for next student
+            document.getElementById('allocationSection').style.display = 'none';
+            document.getElementById('submissionSuccess').style.display = 'block';
+            
+            // Reset for next student after 3 seconds
+            setTimeout(() => {
+                resetForNextStudent();
+            }, 3000);
+        }
+
+        function resetForNextStudent() {
+            document.getElementById('submissionSuccess').style.display = 'none';
+            document.querySelector('.student-name-section').style.display = 'block';
+            document.getElementById('studentName').value = '';
+            currentStudent = null;
+            
+            // Reset tokens
+            const tokens = document.querySelectorAll('.token');
+            tokens.forEach(token => token.classList.remove('used'));
+            
+            // Clear project displays
+            projects.forEach((_, index) => {
+                const projectDiv = document.querySelector(`[data-project-index="${index}"]`);
+                const tokensContainer = projectDiv.querySelector('.project-tokens');
+                const totalElement = projectDiv.querySelector('.project-total');
+                tokensContainer.innerHTML = '';
+                totalElement.textContent = 'Total: 0';
+            });
+        }
+
+        // Results and control functions
+        function showResults() {
+            showPhase('resultsPhase');
+            displayResults();
+        }
+
+        function displayResults() {
+            const resultsList = document.getElementById('resultsList');
+            
+            // Calculate totals for each project
+            const projectTotals = projects.map(() => 0);
+            
+            studentSubmissions.forEach(submission => {
+                Object.keys(submission.allocations).forEach(projectIndex => {
+                    const total = submission.allocations[projectIndex].reduce((sum, val) => sum + val, 0);
+                    projectTotals[projectIndex] += total;
+                });
+            });
+            
+            // Create result items
+            resultsList.innerHTML = '';
+            projectTotals.forEach((total, index) => {
+                const resultDiv = document.createElement('div');
+                resultDiv.className = 'result-item';
+                resultDiv.innerHTML = `
+                    <div class="result-name">${projects[index]}</div>
+                    <div class="result-points">${total} points</div>
+                `;
+                resultsList.appendChild(resultDiv);
+            });
+        }
+
+        function backToCollection() {
+            showPhase('studentPhase');
+        }
+
+        function resetCollection() {
+            if (confirm('Are you sure? This will delete all collected data and start over.')) {
+                // Clear all data
+                projects = [];
+                studentSubmissions = [];
+                submittedStudents.clear();
+                currentStudent = null;
+                studentAllocations = {};
+                
+                // Reset UI elements
+                document.getElementById('submissionCount').textContent = '0';
+                document.getElementById('studentName').value = '';
+                
+                // Hide sections
+                document.getElementById('allocationSection').style.display = 'none';
+                document.getElementById('submissionSuccess').style.display = 'none';
+                document.querySelector('.student-name-section').style.display = 'block';
+                
+                // Clear projects list
+                document.getElementById('projectsList').innerHTML = '';
+                
+                // Clear results
+                document.getElementById('resultsList').innerHTML = '';
+                
+                // Reset tokens
+                const tokens = document.querySelectorAll('.token');
+                tokens.forEach(token => token.classList.remove('used'));
+                
+                // Reset project inputs
+                const projectInputs = document.getElementById('projectInputs');
+                projectInputs.innerHTML = `
+                    <div class="project-input-row">
+                        <input type="text" class="project-input" placeholder="Project name...">
+                        <button class="remove-project" onclick="removeProjectInput(this)" style="display: none;">Remove</button>
+                    </div>
+                    <div class="project-input-row">
+                        <input type="text" class="project-input" placeholder="Project name...">
+                        <button class="remove-project" onclick="removeProjectInput(this)">Remove</button>
+                    </div>
+                    <div class="project-input-row">
+                        <input type="text" class="project-input" placeholder="Project name...">
+                        <button class="remove-project" onclick="removeProjectInput(this)">Remove</button>
+                    </div>
+                `;
+                
+                showPhase('adminPhase');
+            }
+        }
+
+        function showPhase(phaseId) {
+            document.querySelectorAll('.phase').forEach(phase => {
+                phase.classList.remove('active');
+            });
+            document.getElementById(phaseId).classList.add('active');
+        }
+    </script>
+</body>
+</html>
