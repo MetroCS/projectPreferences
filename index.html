@@ -877,22 +877,40 @@
         }
 
         function resetForNextStudent() {
+            // Hide all dynamic sections first
             document.getElementById('submissionSuccess').style.display = 'none';
+            document.getElementById('allocationSection').style.display = 'none';
+            
+            // Show student name section
             document.querySelector('.student-name-section').style.display = 'block';
             document.getElementById('studentName').value = '';
+            document.getElementById('studentName').focus();
+            
             currentStudent = null;
+            studentAllocations = {};
             
-            // Reset tokens
+            // Reset tokens completely
             const tokens = document.querySelectorAll('.token');
-            tokens.forEach(token => token.classList.remove('used'));
+            tokens.forEach(token => {
+                token.classList.remove('used');
+                token.draggable = true;
+            });
             
-            // Clear project displays
+            // Clear project displays and reset drag states
             projects.forEach((_, index) => {
                 const projectDiv = document.querySelector(`[data-project-index="${index}"]`);
-                const tokensContainer = projectDiv.querySelector('.project-tokens');
-                const totalElement = projectDiv.querySelector('.project-total');
-                tokensContainer.innerHTML = '';
-                totalElement.textContent = 'Total: 0';
+                if (projectDiv) {
+                    const tokensContainer = projectDiv.querySelector('.project-tokens');
+                    const totalElement = projectDiv.querySelector('.project-total');
+                    tokensContainer.innerHTML = '';
+                    totalElement.textContent = 'Total: 0';
+                    projectDiv.classList.remove('drag-over');
+                }
+            });
+            
+            // Reset student allocations object
+            projects.forEach((_, index) => {
+                studentAllocations[index] = [];
             });
         }
 
